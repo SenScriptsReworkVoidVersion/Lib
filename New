@@ -1,0 +1,235 @@
+--------------------------------------------------------------------------------
+-- PERSISTENT DURABILITY SETTER
+-- Usage:
+-- 1) edit `targetTextOrNumber` to the text or number you want, e.g. "1.23Qa"
+-- 2) run the script in your exploit
+-- 3) toggle with getgenv().DurabilitySetterEnabled = false to stop
+--------------------------------------------------------------------------------
+
+-- === CONFIG ===
+local targetTextOrNumber = "1.23Qa"   -- <- put "1.23Qa" here
+local checkInterval = 0.1             -- how frequently to re-force (seconds)
+local searchRoots = true              -- allow scanning workspace/replicatedstorage
+
+-- === internals ===
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+if not player then
+    warn("[DurabilitySetter] No LocalPlayer found. Run client-side.")
+    return
+end
+
+getgenv().DurabilitySetterEnabled = true -- toggleable global
+
+local suffixes = {
+    K = 1e3, M = 1e6, B = 1e9,
+    T = 1e12, Qa = 1e15, Qi = 1e18,
+    Sx = 1e21, Sp = 1e24, Oc = 1e27, No = 1e30
+}
+local function toNumber(txt)
+    if type(txt) == "number" then return txt end
+    if not txt then return nil end
+    local n = tonumber(txt)
+    if n then return n end
+    local num, suf = txt:match("([%d%.]+)%s*([%a]+)")
+    if not num then
+        local cleaned = txt:gsub(",","")
+        return tonumber(cleaned)
+    end
+    num = tonumber(num)
+    local mult = suffixes[suf] or suffixes[suf:sub(1,1)] or 1
+    return num * (mult or 1)
+end
+
+local targetNumber = toNumber(targetTextOrNumber)
+local targetText = tostring(targetTextOrNumber)
+
+-- name matching (relaxed)
+local function nameLooksLikeDurability(n)
+    if not n then return false end
+    local lower = n:lower()
+    if lower:find("durab") or lower == "d" or lower == "durability" then
+        return true
+    end
+    return false
+end
+
+-- set value safely
+local function trySet(inst)
+    if not inst or not inst.Parent then return false end
+    local ok, err = pcall(function()
+        if inst:IsA("NumberValue") or inst:IsA("IntValue") then
+            if targetNumber then inst.Value = targetNumber end
+        elseif inst:IsA("StringValue") then
+            inst.Value = targetText
+        elseif inst:IsA("BoolValue") then
+            inst.Value = (targetNumber and targetNumber ~= 0) or targetText == "true"
+        else
+            -- attempt attribute or value child
+            if inst.SetAttribute and inst:GetAttribute("Durability") ~= nil then
+                inst:SetAttribute("Durability", targetNumber or targetText)
+            elseif inst:FindFirstChild("Value") and (inst.Value ~= nil) then
+                -- generic object with .Value property
+                inst.Value = (targetNumber or targetText)
+            else
+                -- try raw property (may error; wrapped in pcall)
+                if pcall(function() return inst.Durability end) then
+                    pcall(function() inst.Durability = (targetNumber or targetText) end)
+                end
+            end
+        end
+    end)
+    return ok
+end
+
+-- search roots for candidate instances
+local function findCandidates()
+    local results = {}
+    local function scan(root)
+        if not root then return end
+        for _,v in ipairs(root:GetDescendants()) do
+            if v.Name and nameLooksLikeDurability(v.Name) then
+                table.insert(results, v)
+            end
+        end
+        -- also scan direct children names
+        for _,v in ipairs(root:GetChildren()) do
+            if v.Name and nameLooksLikeDurability(v.Name) then
+                table.insert(results, v)
+            end
+        end
+    end
+
+    -- player common folders
+    scan(player)
+    if player:FindFirstChild("leaderstats") then scan(player.leaderstats) end
+    if player:FindFirstChild("Stats") then scan(player.Stats) end
+    if player.Character then scan(player.Character) end
+
+    if searchRoots then
+        scan(Workspace)
+        scan(ReplicatedStorage)
+    end
+
+    return results
+end
+
+-- connect Change/Changed events to instantly reset if server changes them
+local connected = {}
+local function secureInstance(inst)
+    if not inst or connected[inst] then return end
+    connected[inst] = true
+
+    -- If it's a Value object, connect its Changed event
+    if inst.Changed then
+        local conn
+        conn = inst.Changed:Connect(function()
+            if not getgenv().DurabilitySetterEnabled then
+                if conn then conn:Disconnect() end
+                connected[inst] = nil
+                return
+            end
+            pcall(function() trySet(inst) end)
+        end)
+    end
+
+    -- If it's an Instance that might get attributes changed, also watch attribute changes (if supported)
+    if inst.AttributeChanged and type(inst.AttributeChanged) == "function" then
+        local aconn
+        aconn = inst.AttributeChanged:Connect(function(attr)
+            if not getgenv().DurabilitySetterEnabled then
+                if aconn then aconn:Disconnect() end
+                connected[inst] = nil
+                return
+            end
+            if attr:lower():find("durab") then
+                pcall(function() inst:SetAttribute(attr, targetNumber or targetText) end)
+            end
+        end)
+    end
+end
+
+-- watch for new descendants in likely roots
+local function watchRootsForNew(root)
+    if not root then return end
+    root.DescendantAdded:Connect(function(inst)
+        if not getgenv().DurabilitySetterEnabled then return end
+        if inst and inst.Name and nameLooksLikeDurability(inst.Name) then
+            wait(0.01)
+            pcall(function() trySet(inst) end)
+            secureInstance(inst)
+        end
+    end)
+end
+
+-- setup watchers
+watchRootsForNew(player)
+if player:FindFirstChild("leaderstats") then watchRootsForNew(player.leaderstats) end
+if player:FindFirstChild("Stats") then watchRootsForNew(player.Stats) end
+if player.Character then watchRootsForNew(player.Character) end
+if searchRoots then
+    watchRootsForNew(Workspace)
+    watchRootsForNew(ReplicatedStorage)
+end
+
+-- main persistent loop
+spawn(function()
+    while getgenv().DurabilitySetterEnabled do
+        local candidates = findCandidates()
+        if #candidates == 0 then
+            -- no named candidate found — try direct typical path(s)
+            local tried = {}
+            local function tryPath(pathParts)
+                local cur = game
+                for _,p in ipairs(pathParts) do
+                    local ok,child = pcall(function() return cur[p] or cur:FindFirstChild(p) end)
+                    cur = child or cur
+                    if not cur then break end
+                end
+                if cur and not tried[cur] then
+                    pcall(function() trySet(cur) end)
+                    secureInstance(cur)
+                    tried[cur] = true
+                end
+            end
+            -- common fallback paths
+            tryPath({"Players", player.Name, "leaderstats", "Durability"})
+            tryPath({"Players", player.Name, "Stats", "Durability"})
+            tryPath({"Workspace", player.Name, "Durability"})
+        else
+            for _,inst in ipairs(candidates) do
+                pcall(function()
+                    trySet(inst)
+                    secureInstance(inst)
+                end)
+            end
+        end
+
+        -- also try scanning ReplicatedStorage for a string Named "Durability" as attribute holder
+        if searchRoots then
+            for _,r in ipairs(ReplicatedStorage:GetDescendants()) do
+                if r.Name and nameLooksLikeDurability(r.Name) then
+                    pcall(function() trySet(r) end)
+                    secureInstance(r)
+                end
+            end
+        end
+
+        wait(checkInterval)
+    end
+
+    -- cleanup on stop
+    print("[DurabilitySetter] Stopped. getgenv().DurabilitySetterEnabled = false")
+end)
+
+-- quick status print and helper functions
+print("[DurabilitySetter] Running. Target:", targetTextOrNumber, "-> numeric:", targetNumber)
+print("[DurabilitySetter] To stop: getgenv().DurabilitySetterEnabled = false")
+print("[DurabilitySetter] To change target on the fly: targetTextOrNumber = '2.00Qa' ; targetNumber = (function() local n=... end)() --- Or re-run script after editing.")
+
+--------------------------------------------------------------------------------
+-- End of script
+--------------------------------------------------------------------------------
